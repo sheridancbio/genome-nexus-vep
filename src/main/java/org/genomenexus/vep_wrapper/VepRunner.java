@@ -3,11 +3,16 @@ package org.genomenexus.vep_wrapper;
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
 import java.io.File;
+import java.io.FileWriter;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.io.OutputStreamWriter;
+import java.io.PrintWriter;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.sql.Timestamp;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -21,6 +26,16 @@ public class VepRunner {
     private static int[] responseOrder = null; // a reordering of the processing output to restore the original request order in our response
 
     private static final String INDEX_DELIMITER = "#";
+
+    private static final boolean sort = false;
+    // TODO temporary files
+    private static final String CONSTRUCTED_INPUT_FILENAME = "/opt/vep/.vep/input/constructed_input_file.txt";
+    private static final String RESULTS_OUTPUT_FILENAME = "/opt/vep/.vep/output/output_from_constructed_input.txt";
+
+    private static void printTimestamp() {
+        Timestamp timestamp = new Timestamp(System.currentTimeMillis());
+        System.out.println(timestamp);
+    }
 
     private static void computeOrders(List<String> requestList) {
         ArrayList<String> workingRequestOrder = new ArrayList();
@@ -52,7 +67,50 @@ public class VepRunner {
         }
     }
 
+    private static void writeRegionsToConstructedInput(List<String> regions) {
+        try {
+            PrintWriter out = new PrintWriter(new BufferedWriter(new FileWriter(CONSTRUCTED_INPUT_FILENAME)));
+            for (String region : regions) {
+                out.println(region);
+            }
+            out.close();
+        } catch (IOException e) {
+            System.err.println("Error - could not construct input file " + CONSTRUCTED_INPUT_FILENAME);
+            System.exit(5);
+        }
+    }
+
+    private static String readResults(Boolean convertToListJSON) {
+        StringBuilder out = new StringBuilder();
+        try (BufferedReader br = Files.newBufferedReader(Paths.get(RESULTS_OUTPUT_FILENAME))) {
+            if (convertToListJSON) {
+                out.append('[');
+                out.append('\n');
+            }
+            String line;
+            Boolean isNotFirstLine = false;
+            while ((line = br.readLine()) != null) {
+                if (isNotFirstLine && convertToListJSON) {
+                    out.append(',');
+                    out.append('\n');
+                }
+                out.append(line);
+                isNotFirstLine = true;
+            }
+            if (convertToListJSON) {
+                out.append(']');
+                out.append('\n');
+            }
+        } catch (IOException e) {
+            // TODO logging?
+            System.err.println("Error - could not read results file " + RESULTS_OUTPUT_FILENAME);
+            System.exit(5);
+        }
+        return out.toString();
+    }
+
     public static String run(List<String> regions, Boolean convertToListJSON) throws IOException, InterruptedException {
+        printTimestamp();
         System.out.println("Running vep");
         // get vep pameters (use -Dvep.params to change)
         String vepParameters = System.getProperty("vep.params", String.join(" ",
@@ -65,7 +123,9 @@ public class VepRunner {
             "--fork 4",
             "--fasta /opt/vep/.vep/homo_sapiens/98_GRCh37/Homo_sapiens.GRCh37.75.dna.primary_assembly.fa.gz",
             "--json",
-            "-o STDOUT",
+            "-i " + CONSTRUCTED_INPUT_FILENAME,
+            "-o " + RESULTS_OUTPUT_FILENAME,
+            "--force_overwrite",
             "--no_stats"
         ));
 
@@ -82,66 +142,56 @@ public class VepRunner {
             commands = replaceOptValue(commands, "--assembly", assembly);
         }
 
+        printTimestamp();
         System.out.println("running command: " + commands);
         //Run macro on target
         ProcessBuilder pb = new ProcessBuilder(commands);
         pb.directory(new File("/opt/vep/src/ensembl-vep"));
         pb.redirectErrorStream(true);
-        System.out.println("staring..");
+        printTimestamp();
+
+        if (sort) {
+            // compute forward and backword reordering
+            printTimestamp();
+            System.out.println("computing order..");
+            computeOrders(regions);
+            printTimestamp();
+            System.out.println("done computing order");
+        }
+
+        printTimestamp();
+        System.out.println("writing constructed input file");
+        writeRegionsToConstructedInput(regions);
+
+        printTimestamp();
+        System.out.println("starting..");
         Process process = pb.start();
 
-        // compute forward and backword reordering
-        computeOrders(regions);
-
-        // send regions to stdin
-        System.out.println("processing requests");
-        OutputStream stdin = process.getOutputStream();
-        BufferedWriter stdinWriter = new BufferedWriter(new OutputStreamWriter(stdin));
-        for (int index : processingOrder) {
-            String region = regions.get(index);
-            stdinWriter.write(region);
-            stdinWriter.write("\n");
-            System.out.print(".");
-        }
-        stdinWriter.flush();
-        stdinWriter.close();
-
-        //Read output
-        StringBuilder out = new StringBuilder();
-        BufferedReader br = new BufferedReader(new InputStreamReader(process.getInputStream()));
-        String line = null, previous = null;
-        if (convertToListJSON) {
-            out.append('[');
-            out.append('\n');
-        }
-        while ((line = br.readLine()) != null) {
-            if (previous != null && convertToListJSON) {
-                out.append(',');
-                out.append('\n');
-                System.out.print("o");
-            }
-            out.append(line);
-            previous = line;
-        }
-        if (convertToListJSON) {
-            out.append(']');
-            out.append('\n');
-        }
+        //Read output from process, this is not our result but might contain errors or something we want to read
 
         // Check result
         int statusCode = process.waitFor();
+        printTimestamp();
+        System.out.println("done processing requests");
+        StringBuilder out = new StringBuilder();
+        try (BufferedReader br = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                out.append(line);
+            }
+        }
+        System.out.println("stdout and stderr:");
+        System.out.println(out.toString());
         if (statusCode == 0) {
             System.out.println("OK");
-            System.out.println(out.toString());
-            return out.toString();
+            return readResults(convertToListJSON);
         }
 
         //TODO: Abnormal termination: Log command parameters and output and throw ExecutionException
         System.out.println("abnormal termination");
         System.out.println("exited with status: " + statusCode);
-        System.out.println("returning output anyway:");
-        System.out.println(out.toString());
-        return out.toString();
+        System.out.println("return empty string to user");
+        return "";
     }
 
     /**
