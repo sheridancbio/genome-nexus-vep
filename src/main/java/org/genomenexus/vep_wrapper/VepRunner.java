@@ -28,6 +28,7 @@ public class VepRunner {
     private static final String VEP_WORK_DIRECTORY_PATH = VEP_ROOT_DIRECTORY_PATH + "/.vep";
     private static final String VEP_TMP_DIRECTORY_PATH = VEP_WORK_DIRECTORY_PATH + "/tmp";
     private static final String VEP_SRC_DIRECTORY_PATH = VEP_ROOT_DIRECTORY_PATH + "/src/ensembl-vep";
+    private static final String VEP_FASTA_FILE_PATH = VEP_WORK_DIRECTORY_PATH + "/homo_sapiens/98_GRCh37/Homo_sapiens.GRCh37.75.dna.primary_assembly.fa.gz";
 
     private static void printTimestamp() {
         Timestamp timestamp = new Timestamp(System.currentTimeMillis());
@@ -41,30 +42,49 @@ public class VepRunner {
         }
     }
 
-    private static void computeOrders(List<String> requestList, int[] processingOrder, int[] responseOrder) {
-        ArrayList<String> workingRequestOrder = new ArrayList<String>();
-        System.out.println("computing order of input list (list size: " + requestList.size() + ")");
+    private static void computeOrders(List<String> regions, int[] processingOrder, int[] responseOrder) {
+        // group requests first by chromosome, then by start position, then by end position
+        // each request is represented by RegionOrderRecord : chromosomeId, startPosition, endPosition, originalOrderPosition
+        // each request is added into an ArrayList and then sorted with a comparitor function
+        // the new ordering is used to populate the two Order arrays
+        System.out.println("computing order of input list (list size: " + regions.size() + ")");
+        ArrayList<RegionOrderRecord> regionOrder = new ArrayList<RegionOrderRecord>(regions.size());
         int index = 0;
-        for (String request : requestList) {
-            workingRequestOrder.add(request + INDEX_DELIMITER + Integer.toString(index));
-            index = index + 1;
-        }
-        Collections.sort(workingRequestOrder);
-        int sortedIndex= 0;
-        for (String request : workingRequestOrder) {
-            String[] parts = request.split(INDEX_DELIMITER);
-            if (parts.length < 2) {
-                System.out.println("something bad happened during split of working order");
-                System.exit(3);
+        for (String region : regions) {
+            String[] regionField = region.split(":");
+            if (regionField.length < 2) {
+                System.out.println("error : could not determine sort order for malformatted region : " + region);
+                System.exit(1);
+            }
+            String[] positionSubField = regionField[1].split("-");
+            String startPositionString = positionSubField[0];
+            String endPositionString = positionSubField[0];
+            if (positionSubField.length > 1) {
+                endPositionString = positionSubField[1];
+            }
+            RegionOrderRecord record = new RegionOrderRecord();
+            record.setChromosome(regionField[0]);
+            try {
+                record.setStartPosition(Integer.parseInt(startPositionString));
+            } catch (NumberFormatException e) {
+                System.out.println("error : encountered region with malformatted start position : " + region);
+                System.exit(1);
             }
             try {
-                int originalIndex = Integer.parseInt(parts[1]);
-                processingOrder[originalIndex] = sortedIndex;
-                responseOrder[sortedIndex] = originalIndex;
+                record.setEndPosition(Integer.parseInt(endPositionString));
             } catch (NumberFormatException e) {
-                System.out.println("something bad happened during parse of offset of working order");
-                System.exit(3);
+                System.out.println("error : encountered region with malformatted end position : " + region);
+                System.exit(1);
             }
+            record.setOriginalOrderIndex(index);
+            regionOrder.add(record);
+            index = index + 1;
+        }
+        Collections.sort(regionOrder);
+        int sortedIndex= 0;
+        for (RegionOrderRecord record : regionOrder) {
+            processingOrder[record.getOriginalOrderIndex()] = sortedIndex;
+            responseOrder[sortedIndex] = record.getOriginalOrderIndex();
             sortedIndex = sortedIndex + 1;
         }
     }
@@ -96,26 +116,28 @@ public class VepRunner {
         }
     }
 
-    public static void readResults(Boolean convertToListJSON, Path vepOutputFile, OutputStream responseOut) {
+    public static void deliverResults(Boolean convertToListJSON, Path vepOutputFile, int[] responseOrder, OutputStream responseOut) {
         PrintWriter responseWriter = new PrintWriter(new BufferedWriter(new OutputStreamWriter(responseOut)));
         if (convertToListJSON) {
             responseWriter.write("[\n");
         }
-        //TODO: there is a potential performance gain here if we avoid reading the file line by line and instead use IOUtils.copy(myStream, response.getOutputStream());
-        //      in order to do that, we would need to use an external program to add a trailing comma on the end of every line in the vep output file
+        ArrayList<String> results = new ArrayList<String>(responseOrder.length);
         try (BufferedReader br = Files.newBufferedReader(vepOutputFile)) {
             String line;
-            Boolean firstLineWasRead = false;
             while ((line = br.readLine()) != null) {
-                if (firstLineWasRead && convertToListJSON) {
-                    responseWriter.write(",\n");
-                }
-                responseWriter.write(line);
-                firstLineWasRead = true;
+                results.add(line);
             }
         } catch (IOException e) {
             System.err.println("Error - could not read results file " + vepOutputFile);
             System.exit(5);
+        }
+        Boolean firstResultWasDelivered = false;
+        for (int nextIndex : responseOrder) {
+            if (firstResultWasDelivered && convertToListJSON) {
+                responseWriter.write(",\n");
+            }
+            responseWriter.write(results.get(nextIndex));
+            firstResultWasDelivered = true;
         }
         if (convertToListJSON) {
             responseWriter.write("]\n");
@@ -147,7 +169,7 @@ public class VepRunner {
                 "--assembly GRCh37",
                 "--format region",
                 "--fork 4",
-                "--fasta /opt/vep/.vep/homo_sapiens/98_GRCh37/Homo_sapiens.GRCh37.75.dna.primary_assembly.fa.gz",
+                "--fasta " + VEP_FASTA_FILE_PATH,
                 "--json",
                 "-i " + constructedInputFile,
                 "-o " + vepOutputFile,
@@ -213,7 +235,7 @@ public class VepRunner {
             printTimestamp();
             System.out.println("OK");
             //TODO: constructedInputFile.delete();
-            readResults(convertToListJSON, vepOutputFile, responseOut);
+            deliverResults(convertToListJSON, vepOutputFile, responseOrder, responseOut);
         } else {
             //TODO: Abnormal termination: Log command parameters and output and throw ExecutionException
             System.out.println("abnormal termination");
